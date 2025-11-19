@@ -12,7 +12,7 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       CLUSTER_ID: "Wa2e1kBtQk2yVf8aB5s9xQ"
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
@@ -21,6 +21,13 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_LOG_DIRS: /var/lib/kafka/data
+    networks:
+      - streaming-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
 
   postgres:
     image: postgres:15
@@ -33,7 +40,118 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - streaming-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kafka_user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Apache Flink JobManager
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+    networks:
+      - streaming-network
+    volumes:
+      - flink_data:/opt/flink/data
+
+  # Apache Flink TaskManager
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    networks:
+      - streaming-network
+    volumes:
+      - flink_data:/opt/flink/data
+
+  # Producer Container
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: market-producer
+    command: python producer.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - streaming-network
+    restart: unless-stopped
+
+  # Consumer Container
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: market-consumer
+    command: python consumer.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - streaming-network
+    restart: unless-stopped
+
+  # Flink Job Container
+  flink-job:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flink-spread-job
+    command: >
+      bash -c "
+      mkdir -p /tmp/flink-jars &&
+      python -c \"import urllib.request; urllib.request.urlretrieve('https://repo1.maven.org/maven2/org/apache/flink/flink-connector-kafka/3.0.2-1.18/flink-connector-kafka-3.0.2-1.18.jar', '/tmp/flink-jars/flink-connector-kafka.jar')\" &&
+      python -c \"import urllib.request; urllib.request.urlretrieve('https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.2.3/kafka-clients-3.2.3.jar', '/tmp/flink-jars/kafka-clients.jar')\" &&
+      python flink_spread_job.py --jarfile /tmp/flink-jars/flink-connector-kafka.jar --jarfile /tmp/flink-jars/kafka-clients.jar
+      "
+    depends_on:
+      - kafka
+      - flink-jobmanager
+      - flink-taskmanager
+      - consumer
+    networks:
+      - streaming-network
+    restart: unless-stopped
+
+  # Dashboard Container (accessible from host)
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: market-dashboard
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    depends_on:
+      - postgres
+    ports:
+      - "8501:8501"
+    networks:
+      - streaming-network
+    restart: unless-stopped
+
+networks:
+  streaming-network:
+    driver: bridge
 
 volumes:
   postgres_data:
-
+  flink_data:
